@@ -110,12 +110,47 @@ def main():
 
 
         ### init dataset this will automatically download and preprocess the dataset if run for the first time
-        train_dataset = OpenFMRIDataSet(mode='train',datasetPath=dataset_path)
-        val_dataset = OpenFMRIDataSet(mode='val',datasetPath=dataset_path,loadData=False,logger=logger,verbose=verbose)
-        test_dataset = OpenFMRIDataSet(mode='test',datasetPath=dataset_path,loadData=False,logger=logger,verbose=verbose) 
-        
-        train_loader = DataLoader(train_dataset, shuffle=True, batch_size=batch_size, num_workers=num_workers, prefetch_factor=prefetch_factor, pin_memory=device.type == 'cuda')
-        val_loader = DataLoader(val_dataset, shuffle=True, batch_size=batch_size, num_workers=num_workers, prefetch_factor=prefetch_factor, pin_memory=device.type == 'cuda')
+        # Corrected parameters based on the new constructor
+        train_dataset = OpenFMRIDataSet(
+            datasetPath=dataset_path,
+            mode='train',
+            windowLength_ms=250,  # new parameter name
+            windowOverlap=0.3,     # Adjust if needed
+            logger=logger          # Optional, remove if not using a custom logger
+        )
+
+        val_dataset = OpenFMRIDataSet(
+            datasetPath=dataset_path,
+            mode='val',
+            windowLength_ms=250,  # new parameter name
+            windowOverlap=0.3,     # Adjust if needed
+            logger=logger          # Optional
+        )
+
+        test_dataset = OpenFMRIDataSet(
+            datasetPath=dataset_path,
+            mode='test',
+            windowLength_ms=250,  # new parameter name
+            windowOverlap=0.3,     # Adjust if needed
+            logger=logger          # Optional
+        )
+                
+        # Set num_workers=0 to avoid issues with HDF5 file access in multiple workers
+        train_loader = DataLoader(
+            train_dataset,
+            shuffle=True,
+            batch_size=batch_size,
+            num_workers=0,   # Set to 0 for HDF5 single-threaded access
+            pin_memory=True if device.type == 'cuda' else False
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            shuffle=False,
+            batch_size=batch_size,
+            num_workers=0,
+            pin_memory=True if device.type == 'cuda' else False
+        )
 
         #INIT MODEL
         logger.info("Initializing model...")
@@ -181,9 +216,9 @@ def main():
                         break
                     
                     progress_bar.update(1)
-                    
-                    inputs = inputs.to(device)
-                    labels = labels.to(device)
+                                        
+                    inputs = inputs.float().to(device)  # Add .float() to convert to float32
+                    labels = labels.float().to(device)
 
                     index += 1
             
@@ -224,8 +259,8 @@ def main():
                             break
                         index += 1
                         
-                        inputs = inputs.to(device)
-                        labels = labels.to(device)  
+                        inputs = inputs.float().to(device)
+                        labels = labels.float().to(device)
 
                         outputs = model(inputs)
 

@@ -9,7 +9,9 @@ import re
 import numpy as np
 import contextlib
 import mne
-
+import h5py
+import pickle as pkl
+import warnings
 
 class DatasetDownloader:
     """
@@ -58,7 +60,7 @@ class DatasetDownloader:
             else:
                 
                 processer = DatasetPreprocesser(datasetPath = self.datasetPath, 
-                                                processImmediately = True, 
+                                                processImmediately = True, # is the pre-processor converting the data into a different format? 
                                                 mode = self.processingMode, 
                                                 logger = self.logger,
                                                 verbose = self.verbose)
@@ -406,3 +408,163 @@ class DatasetPreprocesser():
 
     def makeWindows(self):
         pass
+
+class DataConverter:
+    def __init__(self, source_dataset_path, target_dataset_path, hdf5_filename, **kwargs):
+        """
+        Converts the OpenFMRI dataset from FIF files to HDF5 format.
+
+        Parameters:
+        - source_dataset_path (str): Path to the existing dataset (e.g., '/srv/synaptech_openfmri').
+        - target_dataset_path (str): Path to save the HDF5 file (e.g., '/srv/synaptech_openfmri_new').
+        - hdf5_filename (str): Name of the HDF5 file to create (e.g., 'openfmri_hybrid.h5').
+        - sample_rate (int): Sampling rate of the data (default: 1100 Hz).
+        - window_length (int): Length of each window in milliseconds (default: 250 ms).
+        - window_overlap (float): Overlap between windows (default: 0.3).
+        - logger (logging.Logger): Logger instance.
+        - verbose (bool): Verbosity flag.
+        """
+        self.source_dataset_path = source_dataset_path
+        self.target_dataset_path = target_dataset_path
+        self.hdf5_filepath = os.path.join(self.target_dataset_path, hdf5_filename)
+        self.sample_rate = kwargs.get('sample_rate', 1100)
+        self.window_length_ms = kwargs.get('window_length', 250)
+        self.window_overlap = kwargs.get('window_overlap', 0.3)
+        self.logger = kwargs.get('logger', None)
+        self.verbose = kwargs.get('verbose', False)
+
+        if self.logger is None:
+            logging.basicConfig(level=logging.INFO)
+            self.logger = logging.getLogger(__name__)
+
+        if self.verbose:
+            self.logger.setLevel(logging.DEBUG)
+
+        self.window_length_frames = int(self.window_length_ms / 1000 * self.sample_rate)
+
+        # Define EEG and MEG indices (assuming they are same across files)
+        self.meg_indices = list(range(0, 306))
+        self.eeg_indices = list(range(306, 380))
+
+        # Initialize data structures
+        self._participantRunsDict = {}
+        self._participantFrameCounts = {}
+        self._participantWindowCounts = {}
+        self._participantWindowIndices = {}
+
+        # Create target directory if it doesn't exist
+        os.makedirs(self.target_dataset_path, exist_ok=True)
+
+    def convert(self):
+        """
+        Converts the dataset from FIF files to HDF5 format.
+        """
+        modes = ['train', 'val', 'test']
+        with h5py.File(self.hdf5_filepath, 'w') as h5f:
+            # Add attributes
+            h5f.attrs['sample_rate'] = self.sample_rate
+            h5f.attrs['window_length'] = self.window_length_ms
+            h5f.attrs['window_overlap'] = self.window_overlap
+
+            for mode in modes:
+                self.logger.info(f"Processing mode: {mode}")
+                mode_group = h5f.create_group(f'synaptech_openfmri/{mode}')
+                windows_group = h5f.create_group(f'windows/{mode}')
+
+                mode_path = os.path.join(self.source_dataset_path, mode)
+                subjects = [d for d in os.listdir(mode_path) if os.path.isdir(os.path.join(mode_path, d))]
+                self._participantRunsDict[mode] = {}
+
+                # Prepare window indices list
+                window_indices_list = []
+
+                for subject_idx, subject in enumerate(subjects):
+                    subject_path = os.path.join(mode_path, subject)
+                    runs = sorted([f for f in os.listdir(subject_path) if f.endswith('.fif')])
+
+                    self._participantRunsDict[mode][subject] = runs
+
+                    for run_idx, run_file in enumerate(runs):
+                        run_name = run_file.replace('.fif', '')
+                        self.logger.info(f"Processing {mode}/{subject}/{run_name}")
+
+                        fif_file_path = os.path.join(subject_path, run_file)
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            with open(os.devnull, 'w') as devnull, contextlib.redirect_stdout(devnull):
+                                raw = mne.io.read_raw_fif(fif_file_path, preload=True)
+
+                        # Get data
+                        data = raw.get_data()
+                        meg_data = data[self.meg_indices, :]
+                        eeg_data = data[self.eeg_indices, :]
+
+                        # Get EMOV
+                        emov = self.find_emov(raw.info['chs'], raw.info['dev_head_t'])
+
+                        # Create group for run
+                        run_group_path = f'synaptech_openfmri/{mode}/{subject}_{run_name}'
+                        run_group = h5f.create_group(run_group_path)
+
+                        # Create datasets for MEG, EEG, EMOV
+                        meg_dataset = run_group.create_dataset(
+                            'meg',
+                            data=meg_data,
+                            chunks=(306, self.window_length_frames),
+                            compression=None
+                        )
+                        eeg_dataset = run_group.create_dataset(
+                            'eeg',
+                            data=eeg_data,
+                            chunks=(74, self.window_length_frames),
+                            compression=None
+                        )
+                        emov_dataset = run_group.create_dataset('emov', data=emov)
+
+                        # Calculate window indices
+                        n_samples = data.shape[1]
+                        step_size = int(self.window_length_frames * (1 - self.window_overlap))
+                        run_window_indices = []
+                        for start_idx in range(0, n_samples - self.window_length_frames + 1, step_size):
+                            window_indices_list.append((subject_idx, run_idx, start_idx))
+                            run_window_indices.append(start_idx)
+
+                        # Store window counts and indices
+                        self._participantFrameCounts[(mode, subject, run_name)] = n_samples
+                        self._participantWindowCounts[(mode, subject, run_name)] = len(run_window_indices)
+                        self._participantWindowIndices[(mode, subject, run_name)] = run_window_indices
+
+                # Save window indices for the mode
+                indices_dataset = windows_group.create_dataset(
+                    'indices',
+                    data=np.array(window_indices_list, dtype=np.int64)
+                )
+
+    @staticmethod
+    def find_emov(channel_locs, dev_head_t):
+        """
+        Calculate the EEG-MEG Offset Vector (EMOV).
+
+        Parameters:
+        - channel_locs: List of channel info (e.g., raw.info['chs']).
+        - dev_head_t: Transformation matrix from device to head coordinates.
+
+        Returns:
+        - emov (np.ndarray): The EMOV vector (3-element array).
+        """
+        eeg_reference_electrode_index = 379  # Index of the reference EEG electrode
+        meg_reference_electrode_index = 236  # Index of the reference MEG electrode
+
+        # Get EEG electrode location
+        eeg_loc = channel_locs[eeg_reference_electrode_index]['loc'][:3]
+
+        # Get MEG sensor location
+        meg_loc = channel_locs[meg_reference_electrode_index]['loc'][:3]
+
+        # Apply device-to-head transformation to MEG location
+        meg_loc_transformed = mne.transforms.apply_trans(dev_head_t, meg_loc)
+
+        # Calculate EMOV
+        emov = np.array(eeg_loc) - np.array(meg_loc_transformed)
+
+        return emov

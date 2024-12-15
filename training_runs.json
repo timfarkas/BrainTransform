@@ -1,9 +1,9 @@
 [
     {
-        "name": "test",
-        "epochs": 7,
+        "name": "run3",
+        "epochs": 10,
         "learning_rate": 0.0001,
         "num_workers": 14,
-        "batch_size": 128,
+        "batch_size": 256,
         "prefetch_factor": 4
     }]
